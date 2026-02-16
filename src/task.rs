@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
@@ -73,42 +72,46 @@ pub struct Link {
 #[derive(Debug, Clone, Serialize)]
 pub struct Note {
     pub author: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: String,
     pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Task {
-    pub id: String,
+    pub id: String, // jj change ID
     pub status: Status,
     pub summary: String,
     pub priority: u8,
     pub agent: Option<String>,
-    pub change: Option<String>,
-    pub created: DateTime<Utc>,
-    pub updated: DateTime<Utc>,
-    pub blocked_by: Vec<String>,
+    pub change: Option<String>, // linked code change ID
+    pub done_at: Option<String>,
+    pub blocked_by: Vec<String>, // change IDs of blocking tasks
     pub links: Vec<Link>,
     pub notes: Vec<Note>,
 }
 
 impl Task {
-    pub fn parse(input: &str) -> Result<Task> {
-        let mut id = None;
-        let mut status = None;
-        let mut summary = None;
+    /// Parse a Task from a jj change ID and its commit description.
+    pub fn from_description(change_id: String, description: &str) -> Result<Task> {
+        let mut lines = description.lines().peekable();
+
+        // First line: "jjt: <summary>"
+        let first_line = lines.next().context("empty description")?;
+        let summary = first_line
+            .strip_prefix("jjt: ")
+            .context("description doesn't start with 'jjt: '")?
+            .to_string();
+
+        let mut status = Status::Open;
         let mut priority = 2u8;
         let mut agent = None;
         let mut change = None;
-        let mut created = None;
-        let mut updated = None;
+        let mut done_at = None;
         let mut blocked_by = Vec::new();
         let mut links = Vec::new();
         let mut notes = Vec::new();
 
-        let mut lines = input.lines().peekable();
-
-        // Parse header key-value pairs
+        // Parse key-value headers
         while let Some(&line) = lines.peek() {
             if line.starts_with("---") {
                 break;
@@ -119,19 +122,10 @@ impl Task {
             }
             let Some((key, value)) = line.split_once(": ") else {
                 // Handle keys with empty values like "agent:"
-                if let Some(key) = line.strip_suffix(':') {
-                    match key {
-                        "agent" | "change" => {}
-                        _ => {}
-                    }
-                    continue;
-                }
                 continue;
             };
             match key {
-                "id" => id = Some(value.to_string()),
-                "status" => status = Some(value.parse()?),
-                "summary" => summary = Some(value.to_string()),
+                "status" => status = value.parse()?,
                 "priority" => priority = value.parse()?,
                 "agent" => {
                     if !value.is_empty() {
@@ -143,8 +137,11 @@ impl Task {
                         change = Some(value.to_string());
                     }
                 }
-                "created" => created = Some(value.parse()?),
-                "updated" => updated = Some(value.parse()?),
+                "done_at" => {
+                    if !value.is_empty() {
+                        done_at = Some(value.to_string());
+                    }
+                }
                 "blocked_by" => {
                     blocked_by = value.split_whitespace().map(String::from).collect();
                 }
@@ -159,20 +156,19 @@ impl Task {
                         });
                     }
                 }
-                _ => {} // ignore unknown headers for forward compat
+                _ => {} // ignore unknown keys for forward compat
             }
         }
 
-        // Parse notes (sections separated by "--- author timestamp")
+        // Parse notes
         while let Some(line) = lines.next() {
             if !line.starts_with("--- ") {
                 continue;
             }
             let header = &line[4..];
-            let (author, timestamp_str) = header
+            let (author, timestamp) = header
                 .split_once(' ')
                 .context("invalid note header, expected 'author timestamp'")?;
-            let timestamp: DateTime<Utc> = timestamp_str.parse()?;
 
             let mut body = String::new();
             while let Some(&next_line) = lines.peek() {
@@ -188,44 +184,39 @@ impl Task {
 
             notes.push(Note {
                 author: author.to_string(),
-                timestamp,
+                timestamp: timestamp.to_string(),
                 body,
             });
         }
 
-        let now = Utc::now();
         Ok(Task {
-            id: id.context("missing id")?,
-            status: status.unwrap_or(Status::Open),
-            summary: summary.context("missing summary")?,
+            id: change_id,
+            status,
+            summary,
             priority,
             agent,
             change,
-            created: created.unwrap_or(now),
-            updated: updated.unwrap_or(now),
+            done_at,
             blocked_by,
             links,
             notes,
         })
     }
 
-    pub fn serialize(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("id: {}\n", self.id));
+    /// Serialize to a jj commit description.
+    pub fn to_description(&self) -> String {
+        let mut out = format!("jjt: {}\n", self.summary);
         out.push_str(&format!("status: {}\n", self.status));
-        out.push_str(&format!("summary: {}\n", self.summary));
         out.push_str(&format!("priority: {}\n", self.priority));
-        out.push_str(&format!(
-            "agent: {}\n",
-            self.agent.as_deref().unwrap_or("")
-        ));
-        out.push_str(&format!(
-            "change: {}\n",
-            self.change.as_deref().unwrap_or("")
-        ));
-        out.push_str(&format!("created: {}\n", self.created.to_rfc3339()));
-        out.push_str(&format!("updated: {}\n", self.updated.to_rfc3339()));
-
+        if let Some(ref agent) = self.agent {
+            out.push_str(&format!("agent: {agent}\n"));
+        }
+        if let Some(ref change) = self.change {
+            out.push_str(&format!("change: {change}\n"));
+        }
+        if let Some(ref done_at) = self.done_at {
+            out.push_str(&format!("done_at: {done_at}\n"));
+        }
         if !self.blocked_by.is_empty() {
             out.push_str(&format!("blocked_by: {}\n", self.blocked_by.join(" ")));
         }
@@ -239,11 +230,7 @@ impl Task {
         }
 
         for note in &self.notes {
-            out.push_str(&format!(
-                "\n--- {} {}\n",
-                note.author,
-                note.timestamp.to_rfc3339()
-            ));
+            out.push_str(&format!("\n--- {} {}\n", note.author, note.timestamp));
             out.push_str(&note.body);
             if !note.body.ends_with('\n') {
                 out.push('\n');
@@ -260,60 +247,59 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let input = "\
-id: jt-a1b2
+        let desc = "\
+jjt: Refactor auth module
 status: open
-summary: Refactor auth module
-priority: 2
-agent:
+priority: 1
+agent: claude
 change: zxkpmory
-created: 2026-02-16T10:00:00+00:00
-updated: 2026-02-16T10:00:00+00:00
-blocked_by: jt-c3d4 jt-e5f6
-links: jt-g7h8/relates_to jt-i9j0/supersedes
+blocked_by: abc123 def456
+links: ghi789/relates_to xyz000/supersedes
 
 --- claude 2026-02-16T10:05:00+00:00
 Auth module has 3 providers,
 need to handle each separately.
 
---- claude 2026-02-16T10:12:00+00:00
+--- pehle 2026-02-16T10:12:00+00:00
 Started with OAuth provider.
 ";
 
-        let task = Task::parse(input).unwrap();
-        assert_eq!(task.id, "jt-a1b2");
+        let task = Task::from_description("vruxwmqv".into(), desc).unwrap();
+        assert_eq!(task.id, "vruxwmqv");
         assert_eq!(task.status, Status::Open);
         assert_eq!(task.summary, "Refactor auth module");
-        assert_eq!(task.priority, 2);
-        assert!(task.agent.is_none());
+        assert_eq!(task.priority, 1);
+        assert_eq!(task.agent.as_deref(), Some("claude"));
         assert_eq!(task.change.as_deref(), Some("zxkpmory"));
-        assert_eq!(task.blocked_by, vec!["jt-c3d4", "jt-e5f6"]);
+        assert_eq!(task.blocked_by, vec!["abc123", "def456"]);
         assert_eq!(task.links.len(), 2);
         assert_eq!(task.notes.len(), 2);
         assert_eq!(task.notes[0].author, "claude");
         assert!(task.notes[0].body.contains("3 providers"));
 
-        // Round-trip
-        let serialized = task.serialize();
-        let task2 = Task::parse(&serialized).unwrap();
-        assert_eq!(task2.id, task.id);
-        assert_eq!(task2.status, task.status);
+        let serialized = task.to_description();
+        let task2 = Task::from_description("vruxwmqv".into(), &serialized).unwrap();
         assert_eq!(task2.summary, task.summary);
+        assert_eq!(task2.status, task.status);
         assert_eq!(task2.blocked_by, task.blocked_by);
         assert_eq!(task2.notes.len(), task.notes.len());
     }
 
     #[test]
-    fn minimal_task() {
-        let input = "\
-id: jt-0001
-summary: Do something
-";
-        let task = Task::parse(input).unwrap();
-        assert_eq!(task.id, "jt-0001");
+    fn minimal() {
+        let desc = "jjt: Do something\nstatus: open\npriority: 2\n";
+        let task = Task::from_description("abc".into(), desc).unwrap();
+        assert_eq!(task.summary, "Do something");
         assert_eq!(task.status, Status::Open);
-        assert_eq!(task.priority, 2);
         assert!(task.blocked_by.is_empty());
         assert!(task.notes.is_empty());
+    }
+
+    #[test]
+    fn done_with_timestamp() {
+        let desc = "jjt: Fix bug\nstatus: done\npriority: 2\ndone_at: 2026-02-16T21:00:00+00:00\n";
+        let task = Task::from_description("abc".into(), desc).unwrap();
+        assert_eq!(task.status, Status::Done);
+        assert!(task.done_at.is_some());
     }
 }

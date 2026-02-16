@@ -1,17 +1,16 @@
 use anyhow::{bail, Result};
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 
-mod id;
-mod store;
+mod jj;
 mod task;
 
-use store::Store;
+use jj::Jj;
 use task::{Link, LinkKind, Note, Status, Task};
 
 #[derive(Parser)]
-#[command(name = "jjt", about = "Lightweight jj-native task tracker")]
+#[command(name = "jjt", about = "jj-native task tracker")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -23,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize task tracking in this repo
+    /// Initialize task tracking (creates jjt bookmark)
     Init,
 
     /// Create a new task
@@ -35,14 +34,14 @@ enum Command {
         #[arg(short, long, default_value_t = 2)]
         priority: u8,
 
-        /// Link to a jj change ID
+        /// Link to a jj change (use @ for current change)
         #[arg(short, long)]
         change: Option<String>,
     },
 
     /// List tasks
     List {
-        /// Only tasks ready to work on (open, no active blockers)
+        /// Only ready tasks (open, no active blockers)
         #[arg(long)]
         ready: bool,
 
@@ -58,20 +57,19 @@ enum Command {
         #[arg(long)]
         done: bool,
 
-        /// Show all tasks regardless of status
+        /// Show all tasks
         #[arg(long)]
         all: bool,
     },
 
     /// Show task details
     Show {
-        /// Task ID (full or prefix)
+        /// Change ID (or prefix)
         id: String,
     },
 
-    /// Claim a task for an agent
+    /// Claim a task
     Claim {
-        /// Task ID
         id: String,
 
         /// Agent name (defaults to $JJT_AGENT or $USER)
@@ -81,7 +79,6 @@ enum Command {
 
     /// Mark a task as done
     Done {
-        /// Task ID
         id: String,
 
         /// Optional closing note
@@ -89,35 +86,30 @@ enum Command {
         note: Option<String>,
     },
 
-    /// Reopen a done or claimed task
-    Reopen {
-        /// Task ID
-        id: String,
-    },
+    /// Reopen a task
+    Reopen { id: String },
 
     /// Add a blocking dependency
     Block {
         /// Task to block
         id: String,
 
-        /// Task that blocks it
+        /// Task that blocks it (change ID)
         #[arg(long)]
         on: String,
     },
 
     /// Remove a blocking dependency
     Unblock {
-        /// Task to unblock
         id: String,
 
-        /// Blocker to remove
+        /// Blocker to remove (change ID)
         #[arg(long)]
         from: String,
     },
 
-    /// Add a note to a task
+    /// Add a note
     Note {
-        /// Task ID
         id: String,
 
         /// Note body
@@ -130,7 +122,6 @@ enum Command {
 
     /// Link two tasks
     Link {
-        /// Source task ID
         id: String,
 
         #[arg(long, group = "link_kind")]
@@ -143,9 +134,9 @@ enum Command {
         duplicates: Option<String>,
     },
 
-    /// Compact old done tasks into a summary log
+    /// Abandon old done tasks
     Decay {
-        /// Age threshold (e.g. 7d, 30d)
+        /// Age threshold in days (e.g. 7d, 30d)
         #[arg(long, default_value = "7d")]
         before: String,
     },
@@ -196,37 +187,81 @@ fn main() -> Result<()> {
     }
 }
 
-// --- Command implementations ---
+// --- Helpers ---
+
+fn default_agent() -> Option<String> {
+    std::env::var("JJT_AGENT")
+        .ok()
+        .or_else(|| std::env::var("USER").ok())
+}
+
+/// Load a task by change ID. Resolves to canonical form first.
+fn load_task(change_id: &str) -> Result<Task> {
+    let canonical = Jj::resolve_change(change_id)?;
+    let desc = Jj::get_description(&canonical)?;
+    Task::from_description(canonical, &desc)
+}
+
+/// Save a task back to jj by updating its commit description.
+fn save_task(task: &Task) -> Result<()> {
+    Jj::describe(&task.id, &task.to_description())
+}
+
+/// Resolve a change spec (could be @, a prefix, a full ID) to a change ID.
+fn resolve_change(spec: &str) -> Result<String> {
+    Jj::resolve_change(spec)
+}
+
+fn load_all_tasks() -> Result<Vec<Task>> {
+    let records = Jj::list_task_records()?;
+    let mut tasks = Vec::new();
+    for (id, desc) in records {
+        match Task::from_description(id, &desc) {
+            Ok(task) => tasks.push(task),
+            Err(e) => eprintln!("warning: skipping malformed task: {e}"),
+        }
+    }
+    Ok(tasks)
+}
+
+// --- Commands ---
 
 fn cmd_init(json: bool) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    Store::init(&cwd)?;
+    Jj::check_repo()?;
+    Jj::init_root()?;
     if json {
         println!(r#"{{"ok":true}}"#);
     } else {
-        println!("initialized .jjt/");
+        println!("initialized jjt (created jjt bookmark)");
     }
     Ok(())
 }
 
 fn cmd_new(summary: String, priority: u8, change: Option<String>, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.next_id()?;
-    let now = Utc::now();
+    // Resolve change spec if provided
+    let change = match change {
+        Some(spec) => Some(resolve_change(&spec)?),
+        None => None,
+    };
+
     let task = Task {
-        id,
+        id: String::new(), // placeholder, set by jj
         status: Status::Open,
         summary,
         priority,
         agent: None,
         change,
-        created: now,
-        updated: now,
+        done_at: None,
         blocked_by: vec![],
         links: vec![],
         notes: vec![],
     };
-    store.save(&task)?;
+    let change_id = Jj::create_child(&task.to_description())?;
+    let task = Task {
+        id: change_id,
+        ..task
+    };
+
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
@@ -243,10 +278,8 @@ fn cmd_list(
     all: bool,
     json: bool,
 ) -> Result<()> {
-    let store = Store::open()?;
-    let tasks = store.list_all()?;
+    let tasks = load_all_tasks()?;
 
-    // Build set of done task IDs for computing blocked status
     let done_ids: HashSet<&str> = tasks
         .iter()
         .filter(|t| t.status == Status::Done)
@@ -255,7 +288,6 @@ fn cmd_list(
 
     let agent = default_agent();
 
-    // Compute display info: is each task blocked?
     struct Row<'a> {
         task: &'a Task,
         is_blocked: bool,
@@ -265,7 +297,9 @@ fn cmd_list(
         .iter()
         .map(|t| {
             let is_blocked = !t.blocked_by.is_empty()
-                && t.blocked_by.iter().any(|dep| !done_ids.contains(dep.as_str()));
+                && t.blocked_by
+                    .iter()
+                    .any(|dep| !done_ids.contains(dep.as_str()));
             Row {
                 task: t,
                 is_blocked,
@@ -292,7 +326,6 @@ fn cmd_list(
             if done {
                 return r.task.status == Status::Done;
             }
-            // Default: show open and claimed (not done)
             r.task.status != Status::Done
         })
         .collect();
@@ -339,7 +372,7 @@ fn cmd_list(
                 .map(|c| format!("  @{c}"))
                 .unwrap_or_default();
             println!(
-                "{:<9} {:<8} p{}  {}{agent_str}{change_str}",
+                "{:<13} {:<8} p{}  {}{agent_str}{change_str}",
                 t.id, status_str, t.priority, t.summary
             );
         }
@@ -347,64 +380,54 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_show(partial_id: &str, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let task = store.load(&id)?;
-
+fn cmd_show(id: &str, json: bool) -> Result<()> {
+    let task = load_task(id)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&task)?);
     } else {
-        print!("{}", task.serialize());
+        println!("id: {}", task.id);
+        print!("{}", task.to_description());
     }
     Ok(())
 }
 
-fn cmd_claim(partial_id: &str, agent: Option<String>, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let mut task = store.load(&id)?;
-
-    let agent = agent.or_else(default_agent).unwrap_or_else(|| "unknown".into());
+fn cmd_claim(id: &str, agent: Option<String>, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
+    let agent = agent
+        .or_else(default_agent)
+        .unwrap_or_else(|| "unknown".into());
 
     if task.status == Status::Done {
-        bail!("task {} is already done", id);
+        bail!("task {} is already done", task.id);
     }
     if task.status == Status::Claimed {
-        if task.agent.as_deref() == Some(&agent) {
-            bail!("task {} is already claimed by {}", id, agent);
-        }
         bail!(
             "task {} is already claimed by {}",
-            id,
+            task.id,
             task.agent.as_deref().unwrap_or("unknown")
         );
     }
 
     task.status = Status::Claimed;
     task.agent = Some(agent.clone());
-    task.updated = Utc::now();
-    store.save(&task)?;
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("{} claimed by {}", id, agent);
+        println!("{} claimed by {}", task.id, agent);
     }
     Ok(())
 }
 
-fn cmd_done(partial_id: &str, note: Option<String>, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let mut task = store.load(&id)?;
-
+fn cmd_done(id: &str, note: Option<String>, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
     if task.status == Status::Done {
-        bail!("task {} is already done", id);
+        bail!("task {} is already done", task.id);
     }
 
     task.status = Status::Done;
-    task.updated = Utc::now();
+    task.done_at = Some(Utc::now().to_rfc3339());
 
     if let Some(body) = note {
         let author = task
@@ -414,94 +437,81 @@ fn cmd_done(partial_id: &str, note: Option<String>, json: bool) -> Result<()> {
             .unwrap_or_else(|| "unknown".into());
         task.notes.push(Note {
             author,
-            timestamp: Utc::now(),
+            timestamp: Utc::now().to_rfc3339(),
             body,
         });
     }
 
-    store.save(&task)?;
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("{} done", id);
+        println!("{} done", task.id);
     }
     Ok(())
 }
 
-fn cmd_reopen(partial_id: &str, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let mut task = store.load(&id)?;
-
+fn cmd_reopen(id: &str, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
     task.status = Status::Open;
     task.agent = None;
-    task.updated = Utc::now();
-    store.save(&task)?;
+    task.done_at = None;
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("{} reopened", id);
+        println!("{} reopened", task.id);
     }
     Ok(())
 }
 
-fn cmd_block(partial_id: &str, on_partial: &str, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let on_id = store.resolve_id(on_partial)?;
+fn cmd_block(id: &str, on: &str, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
+    // Verify the blocker is a valid task
+    let blocker = load_task(on)?;
 
-    if id == on_id {
+    if task.id == blocker.id {
         bail!("a task cannot block itself");
     }
-
-    let mut task = store.load(&id)?;
-    if task.blocked_by.contains(&on_id) {
-        bail!("{} is already blocked by {}", id, on_id);
+    if task.blocked_by.contains(&blocker.id) {
+        bail!("{} is already blocked by {}", task.id, blocker.id);
     }
 
-    task.blocked_by.push(on_id.clone());
-    task.updated = Utc::now();
-    store.save(&task)?;
+    task.blocked_by.push(blocker.id.clone());
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("{} blocked by {}", id, on_id);
+        println!("{} blocked by {}", task.id, blocker.id);
     }
     Ok(())
 }
 
-fn cmd_unblock(partial_id: &str, from_partial: &str, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let from_id = store.resolve_id(from_partial)?;
+fn cmd_unblock(id: &str, from: &str, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
+    let blocker = load_task(from)?;
 
-    let mut task = store.load(&id)?;
     let before = task.blocked_by.len();
-    task.blocked_by.retain(|b| b != &from_id);
-
+    task.blocked_by.retain(|b| b != &blocker.id);
     if task.blocked_by.len() == before {
-        bail!("{} is not blocked by {}", id, from_id);
+        bail!("{} is not blocked by {}", task.id, blocker.id);
     }
 
-    task.updated = Utc::now();
-    store.save(&task)?;
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("{} unblocked from {}", id, from_id);
+        println!("{} unblocked from {}", task.id, blocker.id);
     }
     Ok(())
 }
 
-fn cmd_note(partial_id: &str, body: &str, author: Option<String>, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let mut task = store.load(&id)?;
-
+fn cmd_note(id: &str, body: &str, author: Option<String>, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
     let author = author
         .or_else(|| task.agent.clone())
         .or_else(default_agent)
@@ -509,41 +519,46 @@ fn cmd_note(partial_id: &str, body: &str, author: Option<String>, json: bool) ->
 
     task.notes.push(Note {
         author,
-        timestamp: Utc::now(),
+        timestamp: Utc::now().to_rfc3339(),
         body: body.to_string(),
     });
-    task.updated = Utc::now();
-    store.save(&task)?;
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("noted on {}", id);
+        println!("noted on {}", task.id);
     }
     Ok(())
 }
 
-fn cmd_link(partial_id: &str, target_partial: &str, kind: LinkKind, json: bool) -> Result<()> {
-    let store = Store::open()?;
-    let id = store.resolve_id(partial_id)?;
-    let target = store.resolve_id(target_partial)?;
+fn cmd_link(id: &str, target: &str, kind: LinkKind, json: bool) -> Result<()> {
+    let mut task = load_task(id)?;
+    let target_task = load_task(target)?;
 
-    let mut task = store.load(&id)?;
-    if task.links.iter().any(|l| l.target == target && l.kind == kind) {
-        bail!("{} already linked to {} as {}", id, target, kind);
+    if task
+        .links
+        .iter()
+        .any(|l| l.target == target_task.id && l.kind == kind)
+    {
+        bail!(
+            "{} already linked to {} as {}",
+            task.id,
+            target_task.id,
+            kind
+        );
     }
 
     task.links.push(Link {
-        target: target.clone(),
+        target: target_task.id.clone(),
         kind,
     });
-    task.updated = Utc::now();
-    store.save(&task)?;
+    save_task(&task)?;
 
     if json {
         println!("{}", serde_json::to_string(&task)?);
     } else {
-        println!("{} -> {} ({})", id, target, kind);
+        println!("{} -> {} ({})", task.id, target_task.id, kind);
     }
     Ok(())
 }
@@ -553,19 +568,24 @@ fn cmd_decay(before: &str, json: bool) -> Result<()> {
         .strip_suffix('d')
         .and_then(|n| n.parse().ok())
         .unwrap_or(7);
-    let cutoff = Utc::now() - Duration::days(days);
+    let cutoff = Utc::now() - chrono::Duration::days(days);
 
-    let store = Store::open()?;
-    let tasks = store.list_all()?;
+    let tasks = load_all_tasks()?;
+    let mut abandoned = Vec::new();
 
-    let mut decayed = Vec::new();
     for task in &tasks {
-        if task.status == Status::Done && task.updated < cutoff {
-            decayed.push(task);
+        if task.status == Status::Done {
+            if let Some(ref done_at) = task.done_at {
+                if let Ok(ts) = done_at.parse::<chrono::DateTime<Utc>>() {
+                    if ts < cutoff {
+                        abandoned.push(task);
+                    }
+                }
+            }
         }
     }
 
-    if decayed.is_empty() {
+    if abandoned.is_empty() {
         if json {
             println!(r#"{{"decayed":0}}"#);
         } else {
@@ -574,35 +594,15 @@ fn cmd_decay(before: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Write summary to decay log
-    let mut log_entry = format!("# decayed {}\n", Utc::now().to_rfc3339());
-    for task in &decayed {
-        log_entry.push_str(&format!(
-            "{}: {} (done {})\n",
-            task.id,
-            task.summary,
-            task.updated.format("%Y-%m-%d")
-        ));
-    }
-    log_entry.push('\n');
-    store.append_decay_log(&log_entry)?;
-
-    // Delete task files
-    let count = decayed.len();
-    for task in &decayed {
-        store.delete(&task.id)?;
+    let count = abandoned.len();
+    for task in &abandoned {
+        Jj::abandon(&task.id)?;
     }
 
     if json {
         println!(r#"{{"decayed":{count}}}"#);
     } else {
-        println!("decayed {} tasks", count);
+        println!("decayed {} tasks (jj abandon)", count);
     }
     Ok(())
-}
-
-fn default_agent() -> Option<String> {
-    std::env::var("JJT_AGENT")
-        .ok()
-        .or_else(|| std::env::var("USER").ok())
 }
